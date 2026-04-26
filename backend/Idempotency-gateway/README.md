@@ -20,35 +20,37 @@ The fix: every request carries a client-generated `Idempotency-Key`. The server 
 
 ### Request flow
 
-```
-POST /process-payment
-│
-├─ No Idempotency-Key header?
-│   └─ 400
-│
-├─ Bad body?
-│   └─ 422 (Pydantic)
-│
-├─ get_or_create(key, hash)   ← atomic, per-key lock
-│   │
-│   ├─ key is new
-│   │   ├─ insert IN_FLIGHT record (under lock)
-│   │   ├─ release lock
-│   │   ├─ run payment (2s)
-│   │   ├─ write result (under lock), release lock
-│   │   ├─ fire event
-│   │   └─ 201
-│   │
-│   ├─ key exists, DIFFERENT body   ← checked before any waiting
-│   │   └─ 422 immediately
-│   │
-│   ├─ key exists, same body, still running
-│   │   ├─ wait on event (up to 30s)
-│   │   ├─ timed out? → 504
-│   │   └─ return cached result + X-Cache-Hit: true
-│   │
-│   └─ key exists, same body, done
-│       └─ return cached result + X-Cache-Hit: true
+```mermaid
+flowchart TD
+    A([Client sends POST /process-payment]) --> B{Idempotency-Key\nheader present?}
+    B -- No --> C([400 Bad Request])
+    B -- Yes --> D{Body valid?\nPydantic check}
+    D -- Invalid --> E([422 Unprocessable Entity])
+    D -- Valid --> F[Acquire per-key lock\nCheck key + body_hash]
+    F --> G{Key exists\nin store?}
+    G -- No / new key --> H[Insert IN_FLIGHT record\nState: IN_FLIGHT]
+    H --> I[Release lock]
+    I --> J[Run payment ~2s]
+    J --> K[Acquire lock\nWrite COMPLETED result]
+    K --> L[Release lock\nTrigger event]
+    L --> M([201 Created])
+    G -- Yes --> N{Body hash\nmatches?}
+    N -- No / conflict --> O([422 Unprocessable Entity])
+    N -- Yes / same body --> P{Record\nstate?}
+    P -- completed --> Q([201 Created\nCache Hit])
+    P -- in_flight --> R[Wait for first request\nto complete - max 30s]
+    R --> S{Event\nreceived?}
+    S -- Timed out --> T([504 Gateway Timeout])
+    S -- Received --> U([201 Created\nCache Hit])
+    style C fill:#e8e6e0,stroke:#9c9a92,color:#2c2c2a
+    style E fill:#e8e6e0,stroke:#9c9a92,color:#2c2c2a
+    style M fill:#d6e8d6,stroke:#5a8a5a,color:#1a3a1a
+    style Q fill:#d6e8d6,stroke:#5a8a5a,color:#1a3a1a
+    style U fill:#d6e8d6,stroke:#5a8a5a,color:#1a3a1a
+    style O fill:#f0d8d8,stroke:#a85050,color:#3a1a1a
+    style T fill:#f0d8d8,stroke:#a85050,color:#3a1a1a
+    style H fill:#dde6f0,stroke:#5a7a9a,color:#1a2a3a
+    style R fill:#dde6f0,stroke:#5a7a9a,color:#1a2a3a
 ```
 
 The payment engine is called exactly once per key — only on the first request. Every other path is a cache hit or a rejection.
@@ -61,24 +63,52 @@ Per-key locks fix this without blocking unrelated payments. A thin meta-lock han
 
 ### Sequence diagram
 
-```
-Client A                   Gateway                 Payment Engine
-   │                          │                          │
-   │─ POST /process-payment ─►│                          │
-   │  Idempotency-Key: K1     │─ Lock(K1): key is new   │
-   │                          │  insert IN_FLIGHT        │
-   │                          │  release Lock(K1) ───────────────┐
-   │                          │─ run payment ───────────►│  lock free
-Client B                      │                     [2s delay]   │
-   │─ POST /process-payment ─►│                          │       │
-   │  Idempotency-Key: K1     │─ Lock(K1): IN_FLIGHT ◄───────────┘
-   │                          │  release Lock(K1)        │
-   │                          │─ await event ───────┐    │
-   │                          │◄────────────────────│────│─ done
-   │                          │  write result        │   │
-   │                          │  event.set() ────────┘   │
-   │◄─ 201 ───────────────────│                          │
-   │◄─ 201 + X-Cache-Hit ─────│                          │
+```mermaid
+sequenceDiagram
+    autonumber
+    participant C as Client
+    participant G as API Server
+    participant S as Idempotency Store
+    participant P as Processing Logic
+
+    Note over C,P: First request (new key)
+    C->>G: POST /process-payment<br/>Idempotency-Key: K1
+    G->>S: check key + body_hash
+    S-->>G: key not found → acquire per-key lock
+    G->>S: insert IN_FLIGHT record
+    G->>S: release lock
+    G->>P: run payment
+    Note over P: ~2s processing
+    P-->>G: payment result
+    G->>S: acquire lock → write COMPLETED result
+    G->>S: release lock → trigger event
+    G-->>C: 201 Created
+
+    Note over C,P: Duplicate request (same key + same body)
+    C->>G: POST /process-payment<br/>Idempotency-Key: K1 (same body)
+    G->>S: check key + body_hash
+    S-->>G: key found → COMPLETED, hash matches
+    G-->>C: 201 Created<br/>X-Cache-Hit: true
+
+    Note over C,P: Conflict (same key, different body)
+    C->>G: POST /process-payment<br/>Idempotency-Key: K1 (different body)
+    G->>S: check key + body_hash
+    S-->>G: key found → hash mismatch → reject immediately
+    G-->>C: 422 Unprocessable Entity
+
+    Note over C,P: In-flight duplicate (concurrent requests)
+    C->>G: POST /process-payment<br/>Idempotency-Key: K2
+    G->>S: check key + body_hash → IN_FLIGHT
+    G->>P: run payment (in background)
+    C->>G: POST /process-payment<br/>Idempotency-Key: K2 (same body, concurrent)
+    G->>S: check key + body_hash
+    S-->>G: key found → IN_FLIGHT, hash matches
+    G->>G: wait for first request to complete (max 30s)
+    Note over P: payment completes
+    P-->>G: payment result
+    G->>S: update COMPLETED + trigger event
+    G-->>C: 201 Created (original)
+    G-->>C: 201 Created<br/>X-Cache-Hit: true (waiter)
 ```
 
 Result is written before event fires — any waiter that wakes up sees a complete record.
