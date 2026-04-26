@@ -116,5 +116,5 @@ async def process_payment(
             )
 
     # Either it was already done when we arrived, or we just waited for it.
-    logger.info("cache hit for key %s", idempotency_key)
+    logger.info("cache hit for key %s (status=%s)", idempotency_key, record.response_status)
     return record.response_body, record.response_status, True
